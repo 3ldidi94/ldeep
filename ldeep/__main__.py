@@ -23,7 +23,7 @@ from ldeep.views.constants import (
     FILETIME_TIMESTAMP_FIELDS,
     FOREST_LEVELS,
 )
-from ldeep import __version__
+from ldeep._version import __version__
 from ldeep.views.ldap_activedirectory import LdapActiveDirectoryView
 from ldeep.views.cache_activedirectory import CacheActiveDirectoryView
 
@@ -37,7 +37,6 @@ import sys
 
 
 class Ldeep(Command):
-
     def __init__(self, query_engine, format="json"):
         self.engine = query_engine
         if format == "json":
@@ -71,25 +70,26 @@ class Ldeep(Command):
                     and extra_records
                 ):
                     print(record["dn"])
-                    if record["gPLink"]:
-                        guids = re_compile("{[^}]+}")
-                        gpo_guids = guids.findall(record["gPLink"])
-                        if len(gpo_guids) > 0:
-                            print("[gPLink]")
-                            print(
-                                "* {}".format(
-                                    "\n* ".join(
-                                        [
-                                            (
-                                                extra_records[g]
-                                                if g in extra_records
-                                                else g
-                                            )
-                                            for g in gpo_guids
-                                        ]
+                    if "gPLink" in record.keys():
+                        if record["gPLink"]:
+                            guids = re_compile("{[^}]+}")
+                            gpo_guids = guids.findall(record["gPLink"])
+                            if len(gpo_guids) > 0:
+                                print("[gPLink]")
+                                print(
+                                    "* {}".format(
+                                        "\n* ".join(
+                                            [
+                                                (
+                                                    extra_records[g]
+                                                    if g in extra_records
+                                                    else g
+                                                )
+                                                for g in gpo_guids
+                                            ]
+                                        )
                                     )
                                 )
-                            )
                 elif "groupPolicyContainer" in record["objectClass"]:
                     print(f"{record['cn']}: {record['displayName']}")
                 elif "dnsNode" in record["objectClass"]:
@@ -259,7 +259,7 @@ class Ldeep(Command):
         Arguments:
             @verbose:bool
                 Results will contain full information
-            @filter:string = ["all", "spn", "enabled", "disabled", "locked", "nopasswordexpire", "passwordexpired", "nokrbpreauth", "reversible"]
+            @filter:string = ["all", "spn", "enabled", "disabled", "locked", "nopasswordexpire", "passwordexpired", "passwordnotrequired", "nokrbpreauth", "reversible"]
         """
         verbose = kwargs.get("verbose", False)
         filter_ = kwargs.get("filter", "all")
@@ -587,6 +587,44 @@ class Ldeep(Command):
                     )
                 print("{field}: {val}".format(field=field, val=val))
 
+        # enum principals affected by PSO if unpriv
+        results = []
+        # users
+        attributes = ["objectClass", "cn", "sAMAccountName", "msDS-PSOApplied"]
+        entries = self.engine.query(self.engine.USER_ALL_FILTER(), attributes)
+        for entry in entries:
+            psos = entry.get("msDS-PSOApplied")
+            if psos:
+                for pso in psos:
+                    pso = next(
+                        map(
+                            lambda x: x.replace("CN=", ""),
+                            filter(lambda x: x.startswith("CN="), pso.split(",")),
+                        )
+                    )
+                    name = entry.get("sAMAccountName")
+                    results.append(f"{name}:{pso}")
+
+        # groups
+        entries = self.engine.query(self.engine.GROUPS_FILTER(), attributes)
+        for entry in entries:
+            psos = entry.get("msDS-PSOApplied")
+            if psos:
+                for pso in psos:
+                    pso = next(
+                        map(
+                            lambda x: x.replace("CN=", ""),
+                            filter(lambda x: x.startswith("CN="), pso.split(",")),
+                        )
+                    )
+                    name = entry.get("sAMAccountName")
+                    results.append(f"{name}:{pso}")
+
+        if results:
+            print("Unprivileged enumeration:")
+            print("principal:pso_name")
+            print(*results, sep="\n")
+
     def list_trusts(self, kwargs):
         """
         List the domain's trust relationships.
@@ -657,16 +695,19 @@ class Ldeep(Command):
         else:
             attributes = ALL
 
-        self.display(
-            self.engine.query(
-                self.engine.ZONES_FILTER(),
-                attributes,
-                base=",".join(
-                    ["CN=MicrosoftDNS,DC=DomainDNSZones", self.engine.base_dn]
+        try:
+            self.display(
+                self.engine.query(
+                    self.engine.ZONES_FILTER(),
+                    attributes,
+                    base=",".join(
+                        ["CN=MicrosoftDNS,DC=DomainDNSZones", self.engine.base_dn]
+                    ),
                 ),
-            ),
-            verbose,
-        )
+                verbose,
+            )
+        except:
+            error(f"Can't list zones", close_array=verbose)
 
     def list_pkis(self, kwargs):
         """
@@ -1239,7 +1280,13 @@ class Ldeep(Command):
                 pid = result["primaryGroupID"]
                 results = list(self.engine.query(self.engine.PRIMARY_GROUP_ID(pid)))
                 if results:
-                    print(results[0]["dn"])
+                    dn = results[0]["dn"]
+                    print(dn)
+                    if recursive:
+                        already_printed.add(dn)
+                        s = lookup_groups(dn, 4, already_printed)
+                        already_printed.union(s)
+
         if len(list(results)) == 0:
             error("User {account} does not exists".format(account=account))
 
@@ -1655,24 +1702,36 @@ class Ldeep(Command):
         else:
             error(f"Unable to remove {user} from {group}, check privileges or dn")
 
+    def action_change_uac(self, kwargs):
+        """
+        Change user account control
+
+        Arguments:
+            #user:string
+                Target user (dn format). Ex: "CN=bob,CN=Users,DC=CORP,DC=LOCAL"
+            #uac:string
+                UAC integer value. Ex: 512 for NORMAL_ACCOUNT
+        """
+        user = kwargs["user"]
+        uac = kwargs["uac"]
+
+        if self.engine.change_uac(user, uac):
+            info(f"UAC successfully changed for {user}")
+        else:
+            error(f"Unable to change UAC for {user}, check privileges or dn")
+
     def action_create_computer(self, kwargs):
         """
         Create a computer account
 
         Arguments:
             #computer_name:string
-                Name of computer to add.
+                Name of computer to add (no '$' needed).
             #computer_pass:string
                 Password set to computer account
         """
         computer = kwargs["computer_name"]
         password = kwargs["computer_pass"]
-
-        try:
-            self.engine.ldap.start_tls()
-        except Exception as e:
-            print(f"Can't create computer, TLS needed: {e}")
-            return
 
         if self.engine.create_computer(computer, password):
             info(f"Computer {computer} successfully created with password {password}")
@@ -1717,12 +1776,6 @@ class Ldeep(Command):
         user = kwargs["user_name"]
         password = kwargs["user_pass"]
 
-        try:
-            self.engine.ldap.start_tls()
-        except Exception as e:
-            print(f"Can't create user, TLS needed: {e}")
-            return
-
         if self.engine.create_user(user, password):
             info(f"User {user} successfully created with password {password}")
         else:
@@ -1756,12 +1809,7 @@ class Ldeep(Command):
 
 
 def main():
-    parser = ArgumentParser()
-    parser.add_argument(
-        "--version",
-        action="version",
-        version="%(prog)s {version}".format(version=__version__),
-    )
+    parser = ArgumentParser(f"ldeep - {__version__}")
     parser.add_argument(
         "-o", "--outfile", default="", help="Store the results in a file"
     )
